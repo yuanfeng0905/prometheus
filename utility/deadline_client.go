@@ -14,6 +14,7 @@
 package utility
 
 import (
+	"crypto/tls"
 	"net"
 	"net/http"
 	"time"
@@ -38,6 +39,7 @@ func NewDeadlineClient(timeout time.Duration) *http.Client {
 
 				return
 			},
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 		},
 	}
 }

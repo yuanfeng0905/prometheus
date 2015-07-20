@@ -172,6 +172,28 @@ Prometheus.Graph.prototype.initialize = function() {
   }
 };
 
+function currentWord($input) {
+  var wordRE = new RegExp("[a-zA-Z0-9:_]");
+  var pos = $input.prop("selectionStart");
+  var str = $input.val();
+  var len = str.length;
+  var start = pos;
+  var end = pos;
+
+  while (start > 0 && str[start-1].match(wordRE)) {
+    start--;
+  }
+  while (end < len && str[end].match(wordRE)) {
+    end++;
+  }
+
+  return {
+    start: start,
+    end: end,
+    word: $input.val().substring(start, end)
+  };
+}
+
 Prometheus.Graph.prototype.populateInsertableMetrics = function() {
   var self = this;
   $.ajax({
@@ -187,7 +209,37 @@ Prometheus.Graph.prototype.populateInsertableMetrics = function() {
         for (var i = 0; i < metrics.length; i++) {
           self.insertMetric[0].options.add(new Option(metrics[i], metrics[i]));
         }
+
+        // For the typeahead autocompletion, we need to remember where to put
+        // the cursor after inserting an autocompleted word (we want to put it
+        // after that word, not at the end of the entire input string).
+        var afterUpdatePos = null;
+
         self.expr.typeahead({
+          // Needs to return true for autocomplete items that should be matched
+          // by the current input.
+          matcher: function(item) {
+            var cw = currentWord(self.expr);
+            if (cw.word.length !== 0 && item.toLowerCase().indexOf(cw.word.toLowerCase()) > -1) {
+              return true;
+            }
+            return false;
+          },
+          // Returns the entire string to which the input field should be set
+          // upon selecting an item from the autocomplete list.
+          updater: function(item) {
+            var str = self.expr.val();
+            var cw = currentWord(self.expr);
+            afterUpdatePos = cw.start + item.length;
+            return str.substring(0, cw.start) + item + str.substring(cw.end, str.length);
+          },
+          // Is called *after* the input field has been set to the string
+          // returned by the "updater" callback. We want to move the cursor to
+          // the end of the actually inserted word here.
+          afterSelect: function(item) {
+            self.expr.prop("selectionStart", afterUpdatePos);
+            self.expr.prop("selectionEnd", afterUpdatePos);
+          },
           source: metrics,
           items: "all"
         });

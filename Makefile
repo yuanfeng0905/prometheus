@@ -1,4 +1,4 @@
-# Copyright 2015 The Prometheus Authors
+# Copyright 2018 The Prometheus Authors
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -11,34 +11,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-GO   := GO15VENDOREXPERIMENT=1 go
-pkgs  = $(shell $(GO) list ./... | grep -v /vendor/)
+include Makefile.common
 
-all: format build test
+STATICCHECK_IGNORE = \
+  github.com/prometheus/prometheus/discovery/kubernetes/kubernetes.go:SA1019 \
+  github.com/prometheus/prometheus/discovery/kubernetes/node.go:SA1019 \
+  github.com/prometheus/prometheus/documentation/examples/remote_storage/remote_storage_adapter/main.go:SA1019 \
+  github.com/prometheus/prometheus/pkg/textparse/lex.l.go:SA4006 \
+  github.com/prometheus/prometheus/pkg/pool/pool.go:SA6002 \
+  github.com/prometheus/prometheus/promql/engine.go:SA6002
 
-test:
-	@echo ">> running tests"
-	@$(GO) test -short $(pkgs)
+DOCKER_IMAGE_NAME       ?= prometheus
 
-format:
-	@echo ">> formatting code"
-	@$(GO) fmt $(pkgs)
+ifdef DEBUG
+	bindata_flags = -debug
+endif
 
-vet:
-	@echo ">> vetting code"
-	@$(GO) vet $(pkgs)
-
-build:
-	@echo ">> building binaries"
-	@./scripts/build.sh
-
-docker:
-	@docker build -t prometheus:$(shell git rev-parse --short HEAD) .
-
+.PHONY: assets
 assets:
 	@echo ">> writing assets"
-	@$(GO) get github.com/jteeuwen/go-bindata/...
-	@$(GO) generate ./web/blob
-
-
-.PHONY: all format build test vet docker assets
+	@$(GO) get -u github.com/jteeuwen/go-bindata/...
+	@go-bindata $(bindata_flags) -pkg ui -o web/ui/bindata.go -ignore '(.*\.map|bootstrap\.js|bootstrap-theme\.css|bootstrap\.css)'  web/ui/templates/... web/ui/static/...
+	@$(GO) fmt ./web/ui

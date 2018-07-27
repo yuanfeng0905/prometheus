@@ -1,24 +1,22 @@
-FROM        sdurrheimer/alpine-glibc
-MAINTAINER  The Prometheus Authors <prometheus-developers@googlegroups.com>
+FROM        quay.io/prometheus/busybox:latest
+LABEL maintainer "The Prometheus Authors <prometheus-developers@googlegroups.com>"
 
-WORKDIR /gopath/src/github.com/prometheus/prometheus
-COPY    . /gopath/src/github.com/prometheus/prometheus
+COPY prometheus                             /bin/prometheus
+COPY promtool                               /bin/promtool
+COPY documentation/examples/prometheus.yml  /etc/prometheus/prometheus.yml
+COPY console_libraries/                     /usr/share/prometheus/console_libraries/
+COPY consoles/                              /usr/share/prometheus/consoles/
 
-RUN apk add --update -t build-deps tar openssl git make bash \
-    && source ./scripts/goenv.sh /go /gopath \
-    && make build \
-    && cp prometheus promtool /bin/ \
-    && mkdir -p /etc/prometheus \
-    && mv ./documentation/examples/prometheus.yml /etc/prometheus/prometheus.yml \
-    && mv ./console_libraries/ ./consoles/ /etc/prometheus/ \
-    && apk del --purge build-deps \
-    && rm -rf /go /gopath /var/cache/apk/*
+RUN ln -s /usr/share/prometheus/console_libraries /usr/share/prometheus/consoles/ /etc/prometheus/
+RUN mkdir -p /prometheus && \
+    chown -R nobody:nogroup etc/prometheus /prometheus
 
+USER       nobody
 EXPOSE     9090
 VOLUME     [ "/prometheus" ]
 WORKDIR    /prometheus
 ENTRYPOINT [ "/bin/prometheus" ]
-CMD        [ "-config.file=/etc/prometheus/prometheus.yml", \
-             "-storage.local.path=/prometheus", \
-             "-web.console.libraries=/etc/prometheus/console_libraries", \
-             "-web.console.templates=/etc/prometheus/consoles" ]
+CMD        [ "--config.file=/etc/prometheus/prometheus.yml", \
+             "--storage.tsdb.path=/prometheus", \
+             "--web.console.libraries=/usr/share/prometheus/console_libraries", \
+             "--web.console.templates=/usr/share/prometheus/consoles" ]

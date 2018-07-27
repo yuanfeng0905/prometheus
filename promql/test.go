@@ -14,6 +14,7 @@
 package promql
 
 import (
+	"context"
 	"fmt"
 	"io/ioutil"
 	"math"
@@ -24,9 +25,8 @@ import (
 
 	"github.com/prometheus/common/model"
 
+	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/storage"
-	"github.com/prometheus/prometheus/storage/local"
-	"github.com/prometheus/prometheus/util/strutil"
 	"github.com/prometheus/prometheus/util/testutil"
 )
 
@@ -39,9 +39,10 @@ var (
 )
 
 const (
-	testStartTime = model.Time(0)
-	epsilon       = 0.000001 // Relative error allowed for sample values.
+	epsilon = 0.000001 // Relative error allowed for sample values.
 )
+
+var testStartTime = time.Unix(0, 0)
 
 // Test is a sequence of read and write commands that are run
 // against a test storage.
@@ -50,9 +51,11 @@ type Test struct {
 
 	cmds []testCommand
 
-	storage      local.Storage
-	closeStorage func()
-	queryEngine  *Engine
+	storage storage.Storage
+
+	queryEngine *Engine
+	context     context.Context
+	cancelCtx   context.CancelFunc
 }
 
 // NewTest returns an initialized empty Test.
@@ -80,8 +83,18 @@ func (t *Test) QueryEngine() *Engine {
 	return t.queryEngine
 }
 
+// Queryable allows querying the test data.
+func (t *Test) Queryable() storage.Queryable {
+	return t.storage
+}
+
+// Context returns the test's context.
+func (t *Test) Context() context.Context {
+	return t.context
+}
+
 // Storage returns the test's storage.
-func (t *Test) Storage() local.Storage {
+func (t *Test) Storage() storage.Storage {
 	return t.storage
 }
 
@@ -98,11 +111,11 @@ func (t *Test) parseLoad(lines []string, i int) (int, *loadCmd, error) {
 	}
 	parts := patLoad.FindStringSubmatch(lines[i])
 
-	gap, err := strutil.StringToDuration(parts[1])
+	gap, err := model.ParseDuration(parts[1])
 	if err != nil {
 		return i, nil, raise(i, "invalid step definition %q: %s", parts[1], err)
 	}
-	cmd := newLoadCmd(gap)
+	cmd := newLoadCmd(time.Duration(gap))
 	for i+1 < len(lines) {
 		i++
 		defLine := lines[i]
@@ -128,26 +141,26 @@ func (t *Test) parseEval(lines []string, i int) (int, *evalCmd, error) {
 	}
 	parts := patEvalInstant.FindStringSubmatch(lines[i])
 	var (
-		mod = parts[1]
-		at  = parts[2]
-		qry = parts[3]
+		mod  = parts[1]
+		at   = parts[2]
+		expr = parts[3]
 	)
-	expr, err := ParseExpr(qry)
+	_, err := ParseExpr(expr)
 	if err != nil {
 		if perr, ok := err.(*ParseErr); ok {
 			perr.Line = i + 1
-			perr.Pos += strings.Index(lines[i], qry)
+			perr.Pos += strings.Index(lines[i], expr)
 		}
 		return i, nil, err
 	}
 
-	offset, err := strutil.StringToDuration(at)
+	offset, err := model.ParseDuration(at)
 	if err != nil {
 		return i, nil, raise(i, "invalid step definition %q: %s", parts[1], err)
 	}
-	ts := testStartTime.Add(offset)
+	ts := testStartTime.Add(time.Duration(offset))
 
-	cmd := newEvalCmd(expr, ts, ts, 0)
+	cmd := newEvalCmd(expr, ts, i+1)
 	switch mod {
 	case "ordered":
 		cmd.ordered = true
@@ -163,7 +176,7 @@ func (t *Test) parseEval(lines []string, i int) (int, *evalCmd, error) {
 			break
 		}
 		if f, err := parseNumber(defLine); err == nil {
-			cmd.expect(0, nil, sequenceValue{value: model.SampleValue(f)})
+			cmd.expect(0, nil, sequenceValue{value: f})
 			break
 		}
 		metric, vals, err := parseSeriesDesc(defLine)
@@ -236,15 +249,15 @@ func (*evalCmd) testCmd()  {}
 // metrics into the storage.
 type loadCmd struct {
 	gap     time.Duration
-	metrics map[model.Fingerprint]model.Metric
-	defs    map[model.Fingerprint][]model.SamplePair
+	metrics map[uint64]labels.Labels
+	defs    map[uint64][]Point
 }
 
 func newLoadCmd(gap time.Duration) *loadCmd {
 	return &loadCmd{
 		gap:     gap,
-		metrics: map[model.Fingerprint]model.Metric{},
-		defs:    map[model.Fingerprint][]model.SamplePair{},
+		metrics: map[uint64]labels.Labels{},
+		defs:    map[uint64][]Point{},
 	}
 }
 
@@ -253,51 +266,49 @@ func (cmd loadCmd) String() string {
 }
 
 // set a sequence of sample values for the given metric.
-func (cmd *loadCmd) set(m model.Metric, vals ...sequenceValue) {
-	fp := m.Fingerprint()
+func (cmd *loadCmd) set(m labels.Labels, vals ...sequenceValue) {
+	h := m.Hash()
 
-	samples := make([]model.SamplePair, 0, len(vals))
+	samples := make([]Point, 0, len(vals))
 	ts := testStartTime
 	for _, v := range vals {
 		if !v.omitted {
-			samples = append(samples, model.SamplePair{
-				Timestamp: ts,
-				Value:     v.value,
+			samples = append(samples, Point{
+				T: ts.UnixNano() / int64(time.Millisecond/time.Nanosecond),
+				V: v.value,
 			})
 		}
 		ts = ts.Add(cmd.gap)
 	}
-	cmd.defs[fp] = samples
-	cmd.metrics[fp] = m
+	cmd.defs[h] = samples
+	cmd.metrics[h] = m
 }
 
 // append the defined time series to the storage.
-func (cmd *loadCmd) append(a storage.SampleAppender) {
-	for fp, samples := range cmd.defs {
-		met := cmd.metrics[fp]
-		for _, smpl := range samples {
-			s := &model.Sample{
-				Metric:    met,
-				Value:     smpl.Value,
-				Timestamp: smpl.Timestamp,
+func (cmd *loadCmd) append(a storage.Appender) error {
+	for h, smpls := range cmd.defs {
+		m := cmd.metrics[h]
+
+		for _, s := range smpls {
+			if _, err := a.Add(m, s.T, s.V); err != nil {
+				return err
 			}
-			a.Append(s)
 		}
 	}
+	return nil
 }
 
 // evalCmd is a command that evaluates an expression for the given time (range)
 // and expects a specific result.
 type evalCmd struct {
-	expr       Expr
-	start, end model.Time
-	interval   time.Duration
+	expr  string
+	start time.Time
+	line  int
 
-	instant       bool
 	fail, ordered bool
 
-	metrics  map[model.Fingerprint]model.Metric
-	expected map[model.Fingerprint]entry
+	metrics  map[uint64]labels.Labels
+	expected map[uint64]entry
 }
 
 type entry struct {
@@ -309,16 +320,14 @@ func (e entry) String() string {
 	return fmt.Sprintf("%d: %s", e.pos, e.vals)
 }
 
-func newEvalCmd(expr Expr, start, end model.Time, interval time.Duration) *evalCmd {
+func newEvalCmd(expr string, start time.Time, line int) *evalCmd {
 	return &evalCmd{
-		expr:     expr,
-		start:    start,
-		end:      end,
-		interval: interval,
-		instant:  start == end && interval == 0,
+		expr:  expr,
+		start: start,
+		line:  line,
 
-		metrics:  map[model.Fingerprint]model.Metric{},
-		expected: map[model.Fingerprint]entry{},
+		metrics:  map[uint64]labels.Labels{},
+		expected: map[uint64]entry{},
 	}
 }
 
@@ -328,26 +337,26 @@ func (ev *evalCmd) String() string {
 
 // expect adds a new metric with a sequence of values to the set of expected
 // results for the query.
-func (ev *evalCmd) expect(pos int, m model.Metric, vals ...sequenceValue) {
+func (ev *evalCmd) expect(pos int, m labels.Labels, vals ...sequenceValue) {
 	if m == nil {
 		ev.expected[0] = entry{pos: pos, vals: vals}
 		return
 	}
-	fp := m.Fingerprint()
-	ev.metrics[fp] = m
-	ev.expected[fp] = entry{pos: pos, vals: vals}
+	h := m.Hash()
+	ev.metrics[h] = m
+	ev.expected[h] = entry{pos: pos, vals: vals}
 }
 
 // compareResult compares the result value with the defined expectation.
-func (ev *evalCmd) compareResult(result model.Value) error {
+func (ev *evalCmd) compareResult(result Value) error {
 	switch val := result.(type) {
-	case model.Matrix:
-		if ev.instant {
-			return fmt.Errorf("received range result on instant evaluation")
-		}
-		seen := map[model.Fingerprint]bool{}
+	case Matrix:
+		return fmt.Errorf("received range result on instant evaluation")
+
+	case Vector:
+		seen := map[uint64]bool{}
 		for pos, v := range val {
-			fp := v.Metric.Fingerprint()
+			fp := v.Metric.Hash()
 			if _, ok := ev.metrics[fp]; !ok {
 				return fmt.Errorf("unexpected metric %s in result", v.Metric)
 			}
@@ -355,48 +364,25 @@ func (ev *evalCmd) compareResult(result model.Value) error {
 			if ev.ordered && exp.pos != pos+1 {
 				return fmt.Errorf("expected metric %s with %v at position %d but was at %d", v.Metric, exp.vals, exp.pos, pos+1)
 			}
-			for i, expVal := range exp.vals {
-				if !almostEqual(float64(expVal.value), float64(v.Values[i].Value)) {
-					return fmt.Errorf("expected %v for %s but got %v", expVal, v.Metric, v.Values)
+			if !almostEqual(exp.vals[0].value, v.V) {
+				return fmt.Errorf("expected %v for %s but got %v", exp.vals[0].value, v.Metric, v.V)
+			}
+
+			seen[fp] = true
+		}
+		for fp, expVals := range ev.expected {
+			if !seen[fp] {
+				fmt.Println("vector result", len(val), ev.expr)
+				for _, ss := range val {
+					fmt.Println("    ", ss.Metric, ss.Point)
 				}
-			}
-			seen[fp] = true
-		}
-		for fp, expVals := range ev.expected {
-			if !seen[fp] {
 				return fmt.Errorf("expected metric %s with %v not found", ev.metrics[fp], expVals)
 			}
 		}
 
-	case model.Vector:
-		if !ev.instant {
-			return fmt.Errorf("received instant result on range evaluation")
-		}
-		seen := map[model.Fingerprint]bool{}
-		for pos, v := range val {
-			fp := v.Metric.Fingerprint()
-			if _, ok := ev.metrics[fp]; !ok {
-				return fmt.Errorf("unexpected metric %s in result", v.Metric)
-			}
-			exp := ev.expected[fp]
-			if ev.ordered && exp.pos != pos+1 {
-				return fmt.Errorf("expected metric %s with %v at position %d but was at %d", v.Metric, exp.vals, exp.pos, pos+1)
-			}
-			if !almostEqual(float64(exp.vals[0].value), float64(v.Value)) {
-				return fmt.Errorf("expected %v for %s but got %v", exp.vals[0].value, v.Metric, v.Value)
-			}
-
-			seen[fp] = true
-		}
-		for fp, expVals := range ev.expected {
-			if !seen[fp] {
-				return fmt.Errorf("expected metric %s with %v not found", ev.metrics[fp], expVals)
-			}
-		}
-
-	case *model.Scalar:
-		if !almostEqual(float64(ev.expected[0].vals[0].value), float64(val.Value)) {
-			return fmt.Errorf("expected scalar %v but got %v", val.Value, ev.expected[0].vals[0].value)
+	case Scalar:
+		if !almostEqual(ev.expected[0].vals[0].value, val.V) {
+			return fmt.Errorf("expected Scalar %v but got %v", val.V, ev.expected[0].vals[0].value)
 		}
 
 	default:
@@ -426,32 +412,74 @@ func (t *Test) Run() error {
 	return nil
 }
 
-// exec processes a single step of the test
+// exec processes a single step of the test.
 func (t *Test) exec(tc testCommand) error {
 	switch cmd := tc.(type) {
 	case *clearCmd:
 		t.clear()
 
 	case *loadCmd:
-		cmd.append(t.storage)
-		t.storage.WaitForIndexing()
+		app, err := t.storage.Appender()
+		if err != nil {
+			return err
+		}
+		if err := cmd.append(app); err != nil {
+			app.Rollback()
+			return err
+		}
+
+		if err := app.Commit(); err != nil {
+			return err
+		}
 
 	case *evalCmd:
-		q := t.queryEngine.newQuery(cmd.expr, cmd.start, cmd.end, cmd.interval)
-		res := q.Exec()
+		q, _ := t.queryEngine.NewInstantQuery(t.storage, cmd.expr, cmd.start)
+		res := q.Exec(t.context)
 		if res.Err != nil {
 			if cmd.fail {
 				return nil
 			}
-			return fmt.Errorf("error evaluating query: %s", res.Err)
+			return fmt.Errorf("error evaluating query %q (line %d): %s", cmd.expr, cmd.line, res.Err)
 		}
+		defer q.Close()
 		if res.Err == nil && cmd.fail {
-			return fmt.Errorf("expected error evaluating query but got none")
+			return fmt.Errorf("expected error evaluating query %q (line %d) but got none", cmd.expr, cmd.line)
 		}
 
 		err := cmd.compareResult(res.Value)
 		if err != nil {
 			return fmt.Errorf("error in %s %s: %s", cmd, cmd.expr, err)
+		}
+
+		// Check query returns same result in range mode,
+		/// by checking against the middle step.
+		q, _ = t.queryEngine.NewRangeQuery(t.storage, cmd.expr, cmd.start.Add(-time.Minute), cmd.start.Add(time.Minute), time.Minute)
+		rangeRes := q.Exec(t.context)
+		if rangeRes.Err != nil {
+			return fmt.Errorf("error evaluating query %q (line %d) in range mode: %s", cmd.expr, cmd.line, rangeRes.Err)
+		}
+		defer q.Close()
+		if cmd.ordered {
+			// Ordering isn't defined for range queries.
+			return nil
+		}
+		mat := rangeRes.Value.(Matrix)
+		vec := make(Vector, 0, len(mat))
+		for _, series := range mat {
+			for _, point := range series.Points {
+				if point.T == timeMilliseconds(cmd.start) {
+					vec = append(vec, Sample{Metric: series.Metric, Point: point})
+					break
+				}
+			}
+		}
+		if _, ok := res.Value.(Scalar); ok {
+			err = cmd.compareResult(Scalar{V: vec[0].Point.V})
+		} else {
+			err = cmd.compareResult(vec)
+		}
+		if err != nil {
+			return fmt.Errorf("error in %s %s (line %d) rande mode: %s", cmd, cmd.expr, cmd.line, err)
 		}
 
 	default:
@@ -462,24 +490,27 @@ func (t *Test) exec(tc testCommand) error {
 
 // clear the current test storage of all inserted samples.
 func (t *Test) clear() {
-	if t.closeStorage != nil {
-		t.closeStorage()
+	if t.storage != nil {
+		if err := t.storage.Close(); err != nil {
+			t.T.Fatalf("closing test storage: %s", err)
+		}
 	}
-	if t.queryEngine != nil {
-		t.queryEngine.Stop()
+	if t.cancelCtx != nil {
+		t.cancelCtx()
 	}
+	t.storage = testutil.NewStorage(t)
 
-	var closer testutil.Closer
-	t.storage, closer = local.NewTestStorage(t, 1)
-
-	t.closeStorage = closer.Close
-	t.queryEngine = NewEngine(t.storage, nil)
+	t.queryEngine = NewEngine(nil, nil, 20, 10*time.Second)
+	t.context, t.cancelCtx = context.WithCancel(context.Background())
 }
 
 // Close closes resources associated with the Test.
 func (t *Test) Close() {
-	t.queryEngine.Stop()
-	t.closeStorage()
+	t.cancelCtx()
+
+	if err := t.storage.Close(); err != nil {
+		t.T.Fatalf("closing test storage: %s", err)
+	}
 }
 
 // samplesAlmostEqual returns true if the two sample lines only differ by a

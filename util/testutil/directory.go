@@ -26,12 +26,15 @@ const (
 
 	// NilCloser is a no-op Closer.
 	NilCloser = nilCloser(true)
+
+	// The number of times that a TemporaryDirectory will retry its removal
+	temporaryDirectoryRemoveRetries = 2
 )
 
 type (
 	// Closer is the interface that wraps the Close method.
 	Closer interface {
-		// Close reaps the underlying directory and its children.  The directory
+		// Close reaps the underlying directory and its children. The directory
 		// could be deleted by its users already.
 		Close()
 	}
@@ -59,7 +62,7 @@ type (
 	}
 
 	// T implements the needed methods of testing.TB so that we do not need
-	// to actually import testing (which has the side affect of adding all
+	// to actually import testing (which has the side effect of adding all
 	// the test flags, which we do not want in non-test binaries even if
 	// they make use of these utilities for some reason).
 	T interface {
@@ -84,14 +87,19 @@ func NewCallbackCloser(fn func()) Closer {
 }
 
 func (t temporaryDirectory) Close() {
+	retries := temporaryDirectoryRemoveRetries
 	err := os.RemoveAll(t.path)
-	if err != nil {
+	for err != nil && retries > 0 {
 		switch {
 		case os.IsNotExist(err):
-			return
+			err = nil
 		default:
-			t.tester.Fatal(err)
+			retries--
+			err = os.RemoveAll(t.path)
 		}
+	}
+	if err != nil {
+		t.tester.Fatal(err)
 	}
 }
 

@@ -17,11 +17,10 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/prometheus/common/model"
-
-	"github.com/prometheus/prometheus/storage/metric"
-	"github.com/prometheus/prometheus/util/strutil"
+	"github.com/prometheus/prometheus/pkg/labels"
 )
 
 // Tree returns a string of the tree structure of the given node.
@@ -103,13 +102,14 @@ func (node *AlertStmt) String() string {
 	s := fmt.Sprintf("ALERT %s", node.Name)
 	s += fmt.Sprintf("\n\tIF %s", node.Expr)
 	if node.Duration > 0 {
-		s += fmt.Sprintf("\n\tFOR %s", strutil.DurationToString(node.Duration))
+		s += fmt.Sprintf("\n\tFOR %s", model.Duration(node.Duration))
 	}
 	if len(node.Labels) > 0 {
-		s += fmt.Sprintf("\n\tWITH %s", node.Labels)
+		s += fmt.Sprintf("\n\tLABELS %s", node.Labels)
 	}
-	s += fmt.Sprintf("\n\tSUMMARY %q", node.Summary)
-	s += fmt.Sprintf("\n\tDESCRIPTION %q", node.Description)
+	if len(node.Annotations) > 0 {
+		s += fmt.Sprintf("\n\tANNOTATIONS %s", node.Annotations)
+	}
 	return s
 }
 
@@ -134,32 +134,47 @@ func (es Expressions) String() (s string) {
 }
 
 func (node *AggregateExpr) String() string {
-	aggrString := fmt.Sprintf("%s(%s)", node.Op, node.Expr)
-	if len(node.Grouping) > 0 {
-		format := "%s BY (%s)"
-		if node.KeepExtraLabels {
-			format += " KEEP_COMMON"
+	aggrString := node.Op.String()
+
+	if node.Without {
+		aggrString += fmt.Sprintf(" without(%s) ", strings.Join(node.Grouping, ", "))
+	} else {
+		if len(node.Grouping) > 0 {
+			aggrString += fmt.Sprintf(" by(%s) ", strings.Join(node.Grouping, ", "))
 		}
-		return fmt.Sprintf(format, aggrString, node.Grouping)
 	}
+
+	aggrString += "("
+	if node.Op.isAggregatorWithParam() {
+		aggrString += fmt.Sprintf("%s, ", node.Param)
+	}
+	aggrString += fmt.Sprintf("%s)", node.Expr)
+
 	return aggrString
 }
 
 func (node *BinaryExpr) String() string {
 	returnBool := ""
 	if node.ReturnBool {
-		returnBool = " BOOL"
+		returnBool = " bool"
 	}
 
 	matching := ""
 	vm := node.VectorMatching
-	if vm != nil && len(vm.On) > 0 {
-		matching = fmt.Sprintf(" ON(%s)", vm.On)
-		if vm.Card == CardManyToOne {
-			matching += fmt.Sprintf(" GROUP_LEFT(%s)", vm.Include)
+	if vm != nil && (len(vm.MatchingLabels) > 0 || vm.On) {
+		if vm.On {
+			matching = fmt.Sprintf(" on(%s)", strings.Join(vm.MatchingLabels, ", "))
+		} else {
+			matching = fmt.Sprintf(" ignoring(%s)", strings.Join(vm.MatchingLabels, ", "))
 		}
-		if vm.Card == CardOneToMany {
-			matching += fmt.Sprintf(" GROUP_RIGHT(%s)", vm.Include)
+		if vm.Card == CardManyToOne || vm.Card == CardOneToMany {
+			matching += " group_"
+			if vm.Card == CardManyToOne {
+				matching += "left"
+			} else {
+				matching += "right"
+			}
+			matching += fmt.Sprintf("(%s)", strings.Join(vm.Include, ", "))
 		}
 	}
 	return fmt.Sprintf("%s %s%s%s %s", node.LHS, node.Op, returnBool, matching, node.RHS)
@@ -174,7 +189,11 @@ func (node *MatrixSelector) String() string {
 		Name:          node.Name,
 		LabelMatchers: node.LabelMatchers,
 	}
-	return fmt.Sprintf("%s[%s]", vecSelector.String(), strutil.DurationToString(node.Range))
+	offset := ""
+	if node.Offset != time.Duration(0) {
+		offset = fmt.Sprintf(" offset %s", model.Duration(node.Offset))
+	}
+	return fmt.Sprintf("%s[%s]%s", vecSelector.String(), model.Duration(node.Range), offset)
 }
 
 func (node *NumberLiteral) String() string {
@@ -197,15 +216,19 @@ func (node *VectorSelector) String() string {
 	labelStrings := make([]string, 0, len(node.LabelMatchers)-1)
 	for _, matcher := range node.LabelMatchers {
 		// Only include the __name__ label if its no equality matching.
-		if matcher.Name == model.MetricNameLabel && matcher.Type == metric.Equal {
+		if matcher.Name == labels.MetricName && matcher.Type == labels.MatchEqual {
 			continue
 		}
 		labelStrings = append(labelStrings, matcher.String())
 	}
+	offset := ""
+	if node.Offset != time.Duration(0) {
+		offset = fmt.Sprintf(" offset %s", model.Duration(node.Offset))
+	}
 
 	if len(labelStrings) == 0 {
-		return node.Name
+		return fmt.Sprintf("%s%s", node.Name, offset)
 	}
 	sort.Strings(labelStrings)
-	return fmt.Sprintf("%s{%s}", node.Name, strings.Join(labelStrings, ","))
+	return fmt.Sprintf("%s{%s}%s", node.Name, strings.Join(labelStrings, ","), offset)
 }

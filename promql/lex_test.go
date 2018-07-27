@@ -99,6 +99,26 @@ var tests = []struct {
 		input:    "0x123",
 		expected: []item{{itemNumber, 0, "0x123"}},
 	},
+	// Test strings.
+	{
+		input:    "\"test\\tsequence\"",
+		expected: []item{{itemString, 0, `"test\tsequence"`}},
+	},
+	{
+		input:    "\"test\\\\.expression\"",
+		expected: []item{{itemString, 0, `"test\\.expression"`}},
+	},
+	{
+		input: "\"test\\.expression\"",
+		expected: []item{
+			{itemError, 0, "unknown escape sequence U+002E '.'"},
+			{itemString, 0, `"test\.expression"`},
+		},
+	},
+	{
+		input:    "`test\\.expression`",
+		expected: []item{{itemString, 0, "`test\\.expression`"}},
+	},
 	{
 		// See https://github.com/prometheus/prometheus/issues/939.
 		input: ".٩",
@@ -189,6 +209,9 @@ var tests = []struct {
 		input:    `/`,
 		expected: []item{{itemDIV, 0, `/`}},
 	}, {
+		input:    `^`,
+		expected: []item{{itemPOW, 0, `^`}},
+	}, {
 		input:    `%`,
 		expected: []item{{itemMOD, 0, `%`}},
 	}, {
@@ -197,6 +220,9 @@ var tests = []struct {
 	}, {
 		input:    `or`,
 		expected: []item{{itemLOR, 0, `or`}},
+	}, {
+		input:    `unless`,
+		expected: []item{{itemLUnless, 0, `unless`}},
 	},
 	// Test aggregators.
 	{
@@ -226,29 +252,17 @@ var tests = []struct {
 		input:    "alert",
 		expected: []item{{itemAlert, 0, "alert"}},
 	}, {
-		input:    "keeping_extra",
-		expected: []item{{itemKeepCommon, 0, "keeping_extra"}},
-	}, {
-		input:    "keep_common",
-		expected: []item{{itemKeepCommon, 0, "keep_common"}},
-	}, {
 		input:    "if",
 		expected: []item{{itemIf, 0, "if"}},
 	}, {
 		input:    "for",
 		expected: []item{{itemFor, 0, "for"}},
 	}, {
-		input:    "with",
-		expected: []item{{itemWith, 0, "with"}},
+		input:    "labels",
+		expected: []item{{itemLabels, 0, "labels"}},
 	}, {
-		input:    "description",
-		expected: []item{{itemDescription, 0, "description"}},
-	}, {
-		input:    "summary",
-		expected: []item{{itemSummary, 0, "summary"}},
-	}, {
-		input:    "runbook",
-		expected: []item{{itemRunbook, 0, "runbook"}},
+		input:    "annotations",
+		expected: []item{{itemAnnotations, 0, "annotations"}},
 	}, {
 		input:    "offset",
 		expected: []item{{itemOffset, 0, "offset"}},
@@ -256,8 +270,14 @@ var tests = []struct {
 		input:    "by",
 		expected: []item{{itemBy, 0, "by"}},
 	}, {
+		input:    "without",
+		expected: []item{{itemWithout, 0, "without"}},
+	}, {
 		input:    "on",
 		expected: []item{{itemOn, 0, "on"}},
+	}, {
+		input:    "ignoring",
+		expected: []item{{itemIgnoring, 0, "ignoring"}},
 	}, {
 		input:    "group_left",
 		expected: []item{{itemGroupLeft, 0, "group_left"}},
@@ -373,6 +393,13 @@ var tests = []struct {
 	}, {
 		input: `]`, fail: true,
 	},
+	// Test encoding issues.
+	{
+		input: "\"\xff\"", fail: true,
+	},
+	{
+		input: "`\xff`", fail: true,
+	},
 	// Test series description.
 	{
 		input: `{} _ 1 x .3`,
@@ -415,8 +442,12 @@ var tests = []struct {
 // for the parser to avoid duplicated effort.
 func TestLexer(t *testing.T) {
 	for i, test := range tests {
-		l := lex(test.input)
-		l.seriesDesc = test.seriesDesc
+		l := &lexer{
+			input:      test.input,
+			items:      make(chan item),
+			seriesDesc: test.seriesDesc,
+		}
+		go l.run()
 
 		out := []item{}
 		for it := range l.items {
